@@ -216,9 +216,6 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	// 	return
 	// }
 
-	// fmt.Println("The post message is ", p.Message)
-	// fmt.Fprintf(w, "Post is received %s\n", p.User)
-
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
@@ -269,6 +266,16 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 
 	// Save to BigTable.
 	//  saveToBigTable(p, id)
+
+	fmt.Println("The post message is ", p.Message)
+
+	js, err := json.Marshal(p)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(201)
+	w.Write(js)
 }
 
 func saveToGCS(ctx context.Context, file io.Reader, bucketName, name string) (*storage.ObjectHandle, *storage.ObjectAttrs, error) {
