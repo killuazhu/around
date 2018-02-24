@@ -2,6 +2,7 @@ package main
 
 import (
 	"cloud.google.com/go/storage"
+	"cloud.google.com/go/bigtable"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -49,6 +50,7 @@ const (
 	ES_URL      = "http://35.190.151.14:9200"
 	BUCKET_NAME = "post-image-195403"
 	PROJECT_ID  = "kyle-gae-195403"
+	BT_INSTANCE = "around-post"
 )
 
 func main() {
@@ -265,7 +267,7 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	//  saveToES(&p, id)
 
 	// Save to BigTable.
-	//  saveToBigTable(p, id)
+	saveToBigTable(p, id)
 
 	fmt.Println("The post message is ", p.Message)
 
@@ -276,6 +278,32 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(201)
 	w.Write(js)
+}
+
+func saveToBigTable(p *Post, id string) {
+	ctx := context.Background()
+	// you must update project name here
+	bt_client, err := bigtable.NewClient(ctx, PROJECT_ID, BT_INSTANCE)
+	if err != nil {
+		panic(err)
+		return
+	}
+
+	tbl := bt_client.Open("post")
+	mut := bigtable.NewMutation()
+	t := bigtable.Now()
+
+	mut.Set("post", "user", t, []byte(p.User))
+	mut.Set("post", "message", t, []byte(p.Message))
+	mut.Set("location", "lat", t, []byte(strconv.FormatFloat(p.Location.Lat, 'f', -1, 64)))
+	mut.Set("location", "lon", t, []byte(strconv.FormatFloat(p.Location.Lon, 'f', -1, 64)))
+
+	err = tbl.Apply(ctx, id, mut)
+	if err != nil {
+		panic(err)
+		return
+	}
+	fmt.Printf("Post is saved to BigTable: %s\n", p.Message)
 }
 
 func saveToGCS(ctx context.Context, file io.Reader, bucketName, name string) (*storage.ObjectHandle, *storage.ObjectAttrs, error) {
