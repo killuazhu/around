@@ -1,8 +1,8 @@
 package main
 
 import (
-	"cloud.google.com/go/storage"
 	"cloud.google.com/go/bigtable"
+	"cloud.google.com/go/storage"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,6 +15,12 @@ import (
 	//"github.com/olivere/elastic"
 	"github.com/pborman/uuid"
 	elastic "gopkg.in/olivere/elastic.v3"
+
+	"github.com/auth0/go-jwt-middleware"
+	"github.com/dgrijalva/jwt-go"
+	"github.com/gorilla/mux"
+
+	"github.com/go-redis/redis"
 )
 
 type Location struct {
@@ -44,25 +50,49 @@ type Post struct {
 */
 
 const (
-	DISTANCE    = "200km"
-	INDEX       = "around"
-	TYPE        = "post"
-	ES_URL      = "http://35.190.151.14:9200"
-	BUCKET_NAME = "post-image-195403"
-	PROJECT_ID  = "kyle-gae-195403"
-	BT_INSTANCE = "around-post"
+	DISTANCE        = "200km"
+	INDEX           = "around"
+	TYPE            = "post"
+	ES_URL          = "http://104.196.68.65:9200"
+	BUCKET_NAME     = "post-image-195403"
+	PROJECT_ID      = "kyle-gae-195403"
+	BT_INSTANCE     = "around-post"
+	ENABLE_MEMCACHE = true
+	REDIS_URL       = "redis-15461.c1.us-central1-2.gce.cloud.redislabs.com:15461"
+	// update redis password
+	REDIS_PASS      = ""
 )
+
+var mySigningKey = []byte("kyle_secret")
 
 func main() {
 
 	// createIndex()
 
 	fmt.Println("started-service")
-	http.HandleFunc("/", handlerRoot)
-	http.HandleFunc("/post", handlerPost)
-	//http.HandleFunc("/search", handlerSearch)
-	http.HandleFunc("/search", handlerSearchEs)
+	// http.HandleFunc("/", handlerRoot)
+	// http.HandleFunc("/post", handlerPost)
+	// //http.HandleFunc("/search", handlerSearch)
+	// http.HandleFunc("/search", handlerSearchEs)
+	// log.Fatal(http.ListenAndServe(":8080", nil))
+
+	r := mux.NewRouter()
+
+	var jwtMiddleware = jwtmiddleware.New(jwtmiddleware.Options{
+		ValidationKeyGetter: func(token *jwt.Token) (interface{}, error) {
+			return mySigningKey, nil
+		},
+		SigningMethod: jwt.SigningMethodHS256,
+	})
+
+	r.Handle("/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
+	r.Handle("/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearchEs))).Methods("GET")
+	r.Handle("/login", http.HandlerFunc(loginHandler)).Methods("POST")
+	r.Handle("/signup", http.HandlerFunc(signupHandler)).Methods("POST")
+
+	http.Handle("/", r)
 	log.Fatal(http.ListenAndServe(":8080", nil))
+
 }
 
 func createIndex() {
@@ -127,6 +157,26 @@ func handlerSearchEs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// query from Redis first
+	key := r.URL.Query().Get("lat") + ":" + r.URL.Query().Get("lon") + ":" + ran
+	if ENABLE_MEMCACHE {
+		rs_client := redis.NewClient(&redis.Options{
+			Addr:     REDIS_URL,
+			Password: REDIS_PASS, // no password set
+			DB:       0,          // use default DB
+		})
+
+		val, err := rs_client.Get(key).Result()
+		if err != nil {
+			fmt.Printf("Redis cannot find the key %s as %v.\n", key, err)
+		} else {
+			fmt.Printf("Redis find the key %s.\n", key)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(val))
+			return
+		}
+	}
+
 	// Define geo distance query as specified in
 	// https://www.elastic.co/guide/en/elasticsearch/reference/5.2/query-dsl-geo-distance-query.html
 	q := elastic.NewGeoDistanceQuery("location")
@@ -165,6 +215,24 @@ func handlerSearchEs(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		panic(err)
 		return
+	}
+
+	// write to redis
+	if ENABLE_MEMCACHE {
+		//Student question: please complete the Set here
+		rs_client := redis.NewClient(&redis.Options{
+			Addr:     REDIS_URL,
+			Password: REDIS_PASS, // no password set
+			DB:       0,          // use default DB
+		})
+
+		err := rs_client.Set(key, js, 0).Err()
+		if err != nil {
+			panic(err)
+			fmt.Printf("Cannot write to Redis with key %s as %v.\n", key, err)
+		} else {
+			fmt.Printf("Redis write is successful with the key %s.\n", key)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -222,17 +290,22 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
 
+	// handle authentication
+	user := r.Context().Value("user")
+	claims := user.(*jwt.Token).Claims
+	username := claims.(jwt.MapClaims)["username"]
+
 	// 32 << 20 is the maxMemory param for ParseMultipartForm, equals to 32MB (1MB = 1024 * 1024 bytes = 2^20 bytes)
 	// After you call ParseMultipartForm, the file will be saved in the server memory with maxMemory size.
 	// If the file size is larger than maxMemory, the rest of the data will be saved in a system temporary file.
 	r.ParseMultipartForm(32 << 20)
 
 	// Parse from form data.
-	fmt.Printf("Received one post request %s\n", r.FormValue("message"))
+	fmt.Printf("Received one post request message %s\n", r.FormValue("message"))
 	lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
 	lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
 	p := &Post{
-		User:    "1111",
+		User:    username.(string),
 		Message: r.FormValue("message"),
 		Location: Location{
 			Lat: lat,
@@ -264,10 +337,10 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	p.Url = attrs.MediaLink
 
 	// Save to ES.
-	//  saveToES(&p, id)
+	saveToES(p, id)
 
 	// Save to BigTable.
-	saveToBigTable(p, id)
+	// saveToBigTable(p, id)
 
 	fmt.Println("The post message is ", p.Message)
 
@@ -347,7 +420,7 @@ func saveToGCS(ctx context.Context, file io.Reader, bucketName, name string) (*s
 	return obj, attrs, err
 }
 
-func saveToEs(p *Post, id string) {
+func saveToES(p *Post, id string) {
 	// Create a client
 	esClient, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
 	if err != nil {
